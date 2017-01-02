@@ -12,6 +12,7 @@
  import ADTS from './adts';
  import Event from '../events';
  import ExpGolomb from './exp-golomb';
+ import HEVCSpsParser from './hevc-sps-parser';
 // import Hex from '../utils/hex';
  import {logger} from '../utils/logger';
  import {ErrorTypes, ErrorDetails} from '../errors';
@@ -25,6 +26,8 @@
     this.config = config;
     this.lastCC = 0;
     this.remuxer = new this.remuxerClass(observer, id, config);
+    this.HEVC = 0x24;
+    this.AVC = 0x1b;
   }
 
   static probe(data) {
@@ -39,7 +42,8 @@
   switchLevel() {
     this.pmtParsed = false;
     this._pmtId = -1;
-    this._avcTrack = {container : 'video/mp2t', type: 'video', id :-1, sequenceNumber: 0, samples : [], len : 0, nbNalu : 0, dropped : 0};
+    // codec HEVC = 0x24, AVC = 0x1b
+    this._videoTrack = {container : 'video/mp2t', type: 'video', streamType: -1, PID : -1, sequenceNumber: 0, samples : [], len : 0, nbNalu : 0, dropped : 0};
     this._aacTrack = {container : 'video/mp2t', type: 'audio', id :-1, sequenceNumber: 0, samples : [], len : 0};
     this._id3Track = {type: 'id3', id :-1, sequenceNumber: 0, samples : [], len : 0};
     this._txtTrack = {type: 'text', id: -1, sequenceNumber: 0, samples: [], len: 0};
@@ -57,7 +61,7 @@
 
   // feed incoming data to the front of the parsing pipeline
   push(data, audioCodec, videoCodec, timeOffset, cc, level, sn, duration) {
-    var avcData, aacData, id3Data,
+    var videoData, aacData, id3Data,
         start, len = data.length, stt, pid, atf, offset,
         codecsOnly = this.remuxer.passthrough,
         unknownPIDs = false;
@@ -82,7 +86,8 @@
     this.lastSN = sn;
 
     var pmtParsed = this.pmtParsed,
-        avcId = this._avcTrack.id,
+        videoPID = this._videoTrack.PID,
+        videoStreamType = this._videoTrack.streamType,
         aacId = this._aacTrack.id,
         id3Id = this._id3Track.id,
         pmtId = this._pmtId;
@@ -90,6 +95,7 @@
     var parsePAT = this._parsePAT,
         parsePMT = this._parsePMT,
         parsePES = this._parsePES,
+        parseHEVCPES = this._parseHEVCPES.bind(this),
         parseAVCPES = this._parseAVCPES.bind(this),
         parseAACPES = this._parseAACPES.bind(this),
         parseID3PES  = this._parseID3PES.bind(this);
@@ -114,25 +120,36 @@
           offset = start + 4;
         }
         switch(pid) {
-          case avcId:
+          case videoPID:
             if (stt) {
-              if (avcData) {
-                parseAVCPES(parsePES(avcData));
+              if (videoData) {
+                var pesData = parsePES(videoData);
+                if(videoStreamType === this.HEVC) {
+                  parseHEVCPES(pesData);
+                } 
+                else if(videoStreamType === this.AVC) {
+                  parseAVCPES(pesData);
+                }
+                else {
+                  logger.error('unsupported video stream type'); 
+                  return;
+                }
+                
                 if (codecsOnly) {
                   // if we have video codec info AND
                   // if audio PID is undefined OR if we have audio codec info,
                   // we have all codec info !
-                  if (this._avcTrack.codec && (aacId === -1 || this._aacTrack.codec)) {
+                  if (this._videoTrack.codec && (aacId === -1 || this._aacTrack.codec)) {
                     this.remux(level,sn,data);
                     return;
                   }
                 }
               }
-              avcData = {data: [], size: 0};
+              videoData = {data: [], size: 0};
             }
-            if (avcData) {
-              avcData.data.push(data.subarray(offset, start + 188));
-              avcData.size += start + 188 - offset;
+            if (videoData) {
+              videoData.data.push(data.subarray(offset, start + 188));
+              videoData.size += start + 188 - offset;
             }
             break;
           case aacId:
@@ -143,7 +160,7 @@
                   // here we now that we have audio codec info
                   // if video PID is undefined OR if we have video codec info,
                   // we have all codec infos !
-                  if (this._aacTrack.codec && (avcId === -1 || this._avcTrack.codec)) {
+                  if (this._aacTrack.codec && (videoPID === -1 || this._videoTrack.codec)) {
                     this.remux(level,sn,data);
                     return;
                   }
@@ -179,7 +196,8 @@
               offset += data[offset] + 1;
             }
             let parsedPIDs = parsePMT(data, offset);
-            avcId = this._avcTrack.id = parsedPIDs.avc;
+            videoPID = this._videoTrack.PID = parsedPIDs.videoPID;
+            videoStreamType = this._videoTrack.streamType = parsedPIDs.videoStreamType;
             aacId = this._aacTrack.id = parsedPIDs.aac;
             id3Id = this._id3Track.id = parsedPIDs.id3;
             if (unknownPIDs && !pmtParsed) {
@@ -202,8 +220,17 @@
       }
     }
     // parse last PES packet
-    if (avcData) {
-      parseAVCPES(parsePES(avcData));
+    if (videoData) {
+      var pes = parsePES(videoData);
+      if(videoStreamType === this.HEVC) {
+        parseHEVCPES(pes);
+      } 
+      else if(videoStreamType === this.AVC) {
+        parseAVCPES(pes);
+      }
+      else {
+        logger.error('unsupported video stream type ' + videoStreamType); 
+      }
     }
     if (aacData) {
       parseAACPES(parsePES(aacData));
@@ -215,7 +242,7 @@
   }
 
   remux(level, sn, data) {
-    this.remuxer.remux(level, sn, this._aacTrack, this._avcTrack, this._id3Track, this._txtTrack, this.timeOffset, this.contiguous, data);
+    this.remuxer.remux(level, sn, this._aacTrack, this._videoTrack, this._id3Track, this._txtTrack, this.timeOffset, this.contiguous, data);
   }
 
   destroy() {
@@ -231,7 +258,7 @@
   }
 
   _parsePMT(data, offset) {
-    var sectionLength, tableEnd, programInfoLength, pid, result = { aac : -1, avc : -1, id3 : -1};
+    var sectionLength, tableEnd, programInfoLength, pid, result = { aac : -1, videoPID : -1, videoStreamType: -1, id3 : -1};
     sectionLength = (data[offset + 1] & 0x0f) << 8 | data[offset + 2];
     tableEnd = offset + 3 + sectionLength - 4;
     // to determine where the table is, we have to figure out how
@@ -241,7 +268,8 @@
     offset += 12 + programInfoLength;
     while (offset < tableEnd) {
       pid = (data[offset + 1] & 0x1F) << 8 | data[offset + 2];
-      switch(data[offset]) {
+      var streamType  = data[offset];
+      switch(streamType) {
         // ISO/IEC 13818-7 ADTS AAC (MPEG-2 lower bit-rate audio)
         case 0x0f:
           //logger.log('AAC PID:'  + pid);
@@ -256,19 +284,23 @@
             result.id3 = pid;
           }
           break;
-        // ITU-T Rec. H.264 and ISO/IEC 14496-10 (lower bit-rate video)
-        case 0x1b:
-          //logger.log('AVC PID:'  + pid);
-          if (result.avc === -1) {
-            result.avc = pid;
+        // HEVC
+        case 0x24:
+          if (result.videoPID === -1) {
+            result.videoPID = pid;
+            result.videoStreamType = streamType;
           }
           break;
-        case 0x24:
-          logger.warn('HEVC stream type found, not supported for now');
+        // ITU-T Rec. H.264 and ISO/IEC 14496-10 (lower bit-rate video)
+        case 0x1b:
+          if (result.videoPID === -1) {
+            result.videoPID = pid;
+            result.videoStreamType = streamType;
+          }
           break;
         default:
-          logger.log('unkown stream type:'  + data[offset]);
-          break;
+        logger.log('unkown stream type:'  + streamType);
+        break;
       }
       // move to the next table entry
       // skip past the elementary stream descriptors, if present
@@ -344,8 +376,253 @@
     }
   }
 
+  _parseHEVCPES(pes) {
+        var track = this._videoTrack,
+        samples = track.samples,
+        units = this._parseHEVCNALu(pes.data),
+        units2 = [],
+        debug = false,
+        key = false,
+        length = 0,
+        // expGolombDecoder,
+        avcSample,
+        push;
+        // i;
+    // no NALu found
+    if (units.length === 0 && samples.length > 0) {
+      // append pes.data to previous NAL unit
+      var lastavcSample = samples[samples.length - 1];
+      var lastUnit = lastavcSample.units.units[lastavcSample.units.units.length - 1];
+      var tmp = new Uint8Array(lastUnit.data.byteLength + pes.data.byteLength);
+      tmp.set(lastUnit.data, 0);
+      tmp.set(pes.data, lastUnit.data.byteLength);
+      lastUnit.data = tmp;
+      lastavcSample.units.length += pes.data.byteLength;
+      track.len += pes.data.byteLength;
+    }
+    //free pes.data to save up some memory
+    pes.data = null;
+    var debugString = '';
+
+    var pushAccesUnit = function() {
+      if (units2.length) {
+        // only push AVC sample if starting with a keyframe is not mandatory OR
+        //    if keyframe already found in this fragment OR
+        //       keyframe found in last fragment (track.sps) AND
+        //          samples already appended (we already found a keyframe in this fragment) OR fragment is contiguous
+        if (!this.config.forceKeyFrameOnDiscontinuity ||
+            key === true ||
+            (track.sps /*&& (samples.length || this.contiguous)*/)) 
+        {
+          avcSample = {units: { units : units2, length : length}, pts: pes.pts, dts: pes.dts, key: key};
+          samples.push(avcSample);
+          track.len += length;
+          track.nbNalu += units2.length;
+        } else {
+          // dropped samples, track it
+          track.dropped++;
+        }
+        units2 = [];
+        length = 0;
+      }
+    }.bind(this);
+
+    units.forEach(unit => {
+      switch(unit.type) {
+        case 0:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_TRAIL_N ';
+          }
+          break;
+        case 1:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_TRAIL_R ';
+          }
+          key = true;
+          break;
+        case 2:
+          push = true;
+           if(debug) {
+            debugString += 'SLICE_TSA_N ';
+          }
+          break;
+        case 3:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_TSA_R ';
+          }
+          key = true;
+          break;
+        case 4:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_STSA_N ';
+          }
+          break;
+        case 5:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_STSA_R ';
+          }
+          key = true;
+          break;
+        case 6:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_RADL_N ';
+          }
+          break;
+        case 7:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_RADL_R ';
+          }
+          key = true;
+          break;
+        case 8:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_RASL_N ';
+          }
+          break;                                                  
+        case 9:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_RASL_R ';
+          }
+          key = true;
+          break; 
+        case 16:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_BLA_W_LP ';
+          }
+          break; 
+        case 17:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_BLA_W_RADL ';
+          }
+          break;   
+        case 18:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_BLA_N_LP ';
+          }
+          break; 
+        case 19:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_IDR_W_RADL ';
+          }
+          key = true;
+          break;   
+        case 20:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_IDR_N_LP ';
+          }
+          key = true;
+          break; 
+        case 21:
+          push = true;
+          if(debug) {
+            debugString += 'SLICE_CRA_NUT ';
+          }
+          key = true;
+          break;
+        case 32:
+          push = true;
+          track.vps = [unit.data];
+          if(debug) {
+            debugString += 'VPS ';
+          }
+          break;           
+        //SPS
+        case 33:
+          push = true;
+          if(debug) {
+            debugString += 'SPS ';
+          }
+          track.sps = [unit.data];
+
+          var hevcSPSParser = new HEVCSpsParser(unit.data);
+          var config = hevcSPSParser.readSPSHEVC();
+          track.width = config.width;
+          track.height = config.height;
+          track.duration = this._duration;
+          track.codec = 'hev1.1.6.L93.B0';
+          track.chromaFormatIdc = config.chromaFormatIdc;
+          track.bitDepthLumaMinus8 = config.bitDepthLumaMinus8;
+          track.bitDepthChromaMinus8 = config.bitDepthChromaMinus8;
+          break;
+        //PPS
+        case 34:
+          push = true;
+          if(debug) {
+            debugString += 'PPS ';
+          }
+          // if (!track.pps) {
+            track.pps = [unit.data];
+          // }
+          break;
+        case 35:
+          push = false;
+          if(debug) {
+            debugString += 'AUD ';
+          }
+          pushAccesUnit();
+          break;
+        case 36:
+          push = true;
+          if(debug) {
+            debugString += 'EOS ';
+          }
+          break;
+        case 37:
+          push = true;
+          if(debug) {
+            debugString += 'EOB ';
+          }
+          break;          
+        case 38:
+          push = true;
+          if(debug) {
+            debugString += 'FD ';
+          }
+          break;          
+        case 39:
+          push = true;
+          if(debug) {
+            debugString += 'PREFIX_SEI ';
+          }
+          break;          
+        case 40:
+          push = true;
+          if(debug) {
+            debugString += 'SUFFIX_SEI ';
+          }
+          break;           
+        default:
+          push = false;
+          debugString += 'unknown NAL ' + unit.type + ' ';
+          break;
+      }
+      if(push) {
+        units2.push(unit);
+        length+=unit.data.byteLength;
+      }
+    });
+    if(debug || debugString.length) {
+      logger.log(debugString);
+    }
+    pushAccesUnit();
+  }
+
   _parseAVCPES(pes) {
-    var track = this._avcTrack,
+    var track = this._videoTrack,
         samples = track.samples,
         units = this._parseAVCNALu(pes.data),
         units2 = [],
@@ -566,6 +843,100 @@
     else {
       arr.push(data);
     }
+  }
+
+  _parseHEVCNALu(array) {
+    var i = 0, len = array.byteLength, value, overflow, state = this.avcNaluState;
+    var units = [], unit, unitType, lastUnitStart, lastUnitType;
+    //logger.log('PES:' + Hex.hexDump(array));
+    while (i < len) {
+      value = array[i++];
+      // finding 3 or 4-byte start codes (00 00 01 OR 00 00 00 01)
+      switch (state) {
+        case 0:
+          if (value === 0) {
+            state = 1;
+          }
+          break;
+        case 1:
+          if( value === 0) {
+            state = 2;
+          } else {
+            state = 0;
+          }
+          break;
+        case 2:
+        case 3:
+          if( value === 0) {
+            state = 3;
+          } else if (value === 1 && i < len) {
+            unitType = (array[i] >>> 1) & 0x3F;
+            logger.log('find NALU @ offset:' + i + ',type:' + unitType);
+            if (lastUnitStart) {
+              unit = {data: array.subarray(lastUnitStart, i - state - 1), type: lastUnitType};
+              //logger.log('pushing NALU, type/size:' + unit.type + '/' + unit.data.byteLength);
+              units.push(unit);
+            } else {
+              // lastUnitStart is undefined => this is the first start code found in this PES packet
+              // first check if start code delimiter is overlapping between 2 PES packets,
+              // ie it started in last packet (lastState not zero)
+              // and ended at the beginning of this PES packet (i <= 4 - lastState)
+              let lastState = this.avcNaluState;
+              if(lastState &&  (i <= 4 - lastState)) {
+                // start delimiter overlapping between PES packets
+                // strip start delimiter bytes from the end of last NAL unit
+                let track = this._videoTrack,
+                    samples = track.samples;
+                if (samples.length) {
+                  let lastavcSample = samples[samples.length - 1],
+                      lastUnits = lastavcSample.units.units,
+                      lastUnit = lastUnits[lastUnits.length - 1];
+                  // check if lastUnit had a state different from zero
+                  if (lastUnit.state) {
+                    // strip last bytes
+                    lastUnit.data = lastUnit.data.subarray(0,lastUnit.data.byteLength - lastState);
+                    lastavcSample.units.length -= lastState;
+                    track.len -= lastState;
+                  }
+                }
+              }
+              // If NAL units are not starting right at the beginning of the PES packet, push preceding data into previous NAL unit.
+              overflow  = i - state - 1;
+              if (overflow > 0) {
+                let track = this._avcTrack,
+                    samples = track.samples;
+                //logger.log('first NALU found with overflow:' + overflow);
+                if (samples.length) {
+                  let lastavcSample = samples[samples.length - 1],
+                      lastUnits = lastavcSample.units.units,
+                      lastUnit = lastUnits[lastUnits.length - 1],
+                      tmp = new Uint8Array(lastUnit.data.byteLength + overflow);
+                  tmp.set(lastUnit.data, 0);
+                  tmp.set(array.subarray(0, overflow), lastUnit.data.byteLength);
+                  lastUnit.data = tmp;
+                  lastavcSample.units.length += overflow;
+                  track.len += overflow;
+                }
+              }
+            }
+            lastUnitStart = i;
+            lastUnitType = unitType;
+            state = 0;
+          } else {
+            state = 0;
+          }
+          break;
+        default:
+          break;
+      }
+    }
+    if (lastUnitStart) {
+      unit = {data: array.subarray(lastUnitStart, len), type: lastUnitType, state : state};
+      units.push(unit);
+      //logger.log('pushing NALU, type/size/state:' + unit.type + '/' + unit.data.byteLength + '/' + state);
+      this.avcNaluState = state;
+    }
+    return units;
   }
 
   _parseAVCNALu(array) {

@@ -2,12 +2,16 @@
  * Generate MP4 Box
 */
 
+// import {logger} from '../utils/logger';
+
 //import Hex from '../utils/hex';
 class MP4 {
   static init() {
     MP4.types = {
       avc1: [], // codingname
       avcC: [],
+      hvcC: [],
+      hev1: [],
       btrt: [],
       dinf: [],
       dref: [],
@@ -131,9 +135,11 @@ class MP4 {
 
     var majorBrand = new Uint8Array([105,115,111,109]); // isom
     var avc1Brand = new Uint8Array([97,118,99,49]); // avc1
+    var hev1Brand = new Uint8Array([0x68,0x65,0x76,0x31]); // hev1
     var minorVersion = new Uint8Array([0, 0, 0, 1]);
 
-    MP4.FTYP = MP4.box(MP4.types.ftyp, majorBrand, minorVersion, majorBrand, avc1Brand);
+    MP4.FTYPAVC1 = MP4.box(MP4.types.ftyp, majorBrand, minorVersion, majorBrand, avc1Brand);
+    MP4.FTYPHEV1 = MP4.box(MP4.types.ftyp, majorBrand, minorVersion, majorBrand, hev1Brand);
     MP4.DINF = MP4.box(MP4.types.dinf, MP4.box(MP4.types.dref, dref));
   }
 
@@ -306,6 +312,94 @@ class MP4 {
     return MP4.box(MP4.types.stbl, MP4.stsd(track), MP4.box(MP4.types.stts, MP4.STTS), MP4.box(MP4.types.stsc, MP4.STSC), MP4.box(MP4.types.stsz, MP4.STSZ), MP4.box(MP4.types.stco, MP4.STCO));
   }
 
+  static hev1(track) {
+    var vps = [], sps = [], pps = [], i, data, len;
+
+    vps.push(0x00);
+    vps.push(0x00);
+    vps.push(track.vps.length);
+    for (i = 0; i < track.vps.length; i++) {
+      data = track.vps[i];
+      len = data.byteLength;
+      vps.push((len >>> 8) & 0xFF);
+      vps.push((len & 0xFF));
+      vps = vps.concat(Array.prototype.slice.call(data)); // VPS
+    }
+
+    // assemble the SPSs
+    sps.push(0x00);
+    sps.push(0x00);
+    sps.push(track.sps.length);
+    for (i = 0; i < track.sps.length; i++) {
+      data = track.sps[i];
+      len = data.byteLength;
+      sps.push((len >>> 8) & 0xFF);
+      sps.push((len & 0xFF));
+      sps = sps.concat(Array.prototype.slice.call(data)); // SPS
+    }
+
+    // assemble the PPSs
+    pps.push(0x00);
+    pps.push(0x00);
+    pps.push(track.pps.length);
+    for (i = 0; i < track.pps.length; i++) {
+      data = track.pps[i];
+      len = data.byteLength;
+      pps.push((len >>> 8) & 0xFF);
+      pps.push((len & 0xFF));
+      pps = pps.concat(Array.prototype.slice.call(data)); // PPS
+    }
+
+    var iNumArrays = track.vps.length + track.sps.length + track.pps.length;
+
+    var hvcc = MP4.box(MP4.types.hvcC, new Uint8Array([
+      0x01,   // version
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // general_configuration
+      0xf0, 0x00, // spatial segmentation
+      0xfc | track.chromaFormatIdc & 0x03,
+      0xf8 | track.bitDepthLumaMinus8 & 0x07,
+      0xf8 | track.bitDepthChromaMinus8 & 0x07,
+      0x00, 0x00, // framerate
+      0x00, // numTemporalLayer b_temporalIdNested
+      iNumArrays,
+      ].concat(vps).concat(sps).concat(pps)));
+
+    return MP4.box(MP4.types.hev1, new Uint8Array([
+        0x00, 0x00, 0x00, // reserved
+        0x00, 0x00, 0x00, // reserved
+        0x00, 0x01, // data_reference_index
+        0x00, 0x00, // pre_defined
+        0x00, 0x00, // reserved
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, // pre_defined
+        (track.width >> 8) & 0xFF,
+        track.width & 0xff, // width
+        (track.height >> 8) & 0xFF,
+        track.height & 0xff, // height
+        0x00, 0x48, 0x00, 0x00, // horizresolution
+        0x00, 0x48, 0x00, 0x00, // vertresolution
+        0x00, 0x00, 0x00, 0x00, // reserved
+        0x00, 0x01, // frame_count
+        0x12,
+        0x64, 0x61, 0x69, 0x6C, //dailymotion/hls.js
+        0x79, 0x6D, 0x6F, 0x74,
+        0x69, 0x6F, 0x6E, 0x2F,
+        0x68, 0x6C, 0x73, 0x2E,
+        0x6A, 0x73, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, // compressorname
+        0x00, 0x18,   // depth = 24
+        0x11, 0x11]), // pre_defined = -1
+           hvcc,
+          MP4.box(MP4.types.btrt, new Uint8Array([
+            0x00, 0x1c, 0x9c, 0x80, // bufferSizeDB
+            0x00, 0x2d, 0xc6, 0xc0, // maxBitrate
+            0x00, 0x2d, 0xc6, 0xc0])) // avgBitrate
+          );
+  }
+
   static avc1(track) {
     var sps = [], pps = [], i, data, len;
     // assemble the SPSs
@@ -420,6 +514,10 @@ class MP4 {
     if (track.type === 'audio') {
       return MP4.box(MP4.types.stsd, MP4.STSD, MP4.mp4a(track));
     } else {
+      if(track.streamType === 0x24)
+      {
+        return MP4.box(MP4.types.stsd, MP4.STSD, MP4.hev1(track));
+      }
       return MP4.box(MP4.types.stsd, MP4.STSD, MP4.avc1(track));
     }
   }
@@ -578,10 +676,18 @@ class MP4 {
     if (!MP4.types) {
       MP4.init();
     }
+
     var movie = MP4.moov(tracks), result;
-    result = new Uint8Array(MP4.FTYP.byteLength + movie.byteLength);
-    result.set(MP4.FTYP);
-    result.set(movie, MP4.FTYP.byteLength);
+
+    if( tracks[0].type === 'video' && tracks[0].streamType === 0x24) {
+      result = new Uint8Array(MP4.FTYPHEV1.byteLength + movie.byteLength);
+      result.set(MP4.FTYPHEV1);
+      result.set(movie, MP4.FTYPHEV1.byteLength);
+    } else {
+      result = new Uint8Array(MP4.FTYPAVC1.byteLength + movie.byteLength);
+      result.set(MP4.FTYPAVC1);
+      result.set(movie, MP4.FTYPAVC1.byteLength);      
+    }
     return result;
   }
 }

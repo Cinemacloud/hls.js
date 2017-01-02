@@ -12,7 +12,7 @@ import {ErrorTypes, ErrorDetails} from '../errors';
         adtsExtensionSampleingIndex, // :int
         adtsChanelConfig, // :int
         config,
-        userAgent = navigator.userAgent.toLowerCase(),
+        userAgent, 
         adtsSampleingRates = [
             96000, 88200,
             64000, 48000,
@@ -21,6 +21,15 @@ import {ErrorTypes, ErrorDetails} from '../errors';
             16000, 12000,
             11025, 8000,
             7350];
+    try {
+      userAgent = navigator.userAgent.toLowerCase();
+    }
+    catch(e)
+    {
+      userAgent = 'EDGE';
+    }
+    
+
     // byte 2
     adtsObjectType = ((data[offset + 2] & 0xC0) >>> 6) + 1;
     adtsSampleingIndex = ((data[offset + 2] & 0x3C) >>> 2);
